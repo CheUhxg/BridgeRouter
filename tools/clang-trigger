@@ -1,0 +1,2 @@
+#!/bin/bash
+clang-14_bk -flegacy-pass-manager -Xclang -load -Xclang /usr/local/lib/LLVMCapabilityLog.so -O0 $@

@@ -1,0 +1,512 @@
+diff --git a/llvm/lib/Transforms/CMakeLists.txt b/llvm/lib/Transforms/CMakeLists.txt
+index dda5f6de11e3..9d6eb1941efa 100644
+--- a/llvm/lib/Transforms/CMakeLists.txt
++++ b/llvm/lib/Transforms/CMakeLists.txt
+@@ -9,3 +9,4 @@ add_subdirectory(Hello)
+ add_subdirectory(ObjCARC)
+ add_subdirectory(Coroutines)
+ add_subdirectory(CFGuard)
++add_subdirectory(CapabilityLog)
+diff --git a/llvm/lib/Transforms/CapabilityLog/CMakeLists.txt b/llvm/lib/Transforms/CapabilityLog/CMakeLists.txt
+new file mode 100644
+index 000000000000..9c4b495f969d
+--- /dev/null
++++ b/llvm/lib/Transforms/CapabilityLog/CMakeLists.txt
+@@ -0,0 +1,36 @@
++file(GLOB SOURCES
++CapabilityLog.cpp)
++
++include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
++link_directories(${LLVM_LIB_DIRS})
++
++set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DLLVM_MAJOR_VERSION=${LLVM_VERSION_MAJOR}")
++
++# generate MyPass.so
++# add_llvm_pass_plugin must be used with AddLLVM
++add_llvm_pass_plugin(LLVMCapabilityLog
++	${SOURCES}
++)
++
++add_dependencies(LLVMCapabilityLog intrinsics_gen)
++
++set_target_properties(LLVMCapabilityLog PROPERTIES
++						RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
++
++# generate libMyPass.so
++# add_library(MyPass
++#	SHARED
++#	MyPass.cpp
++#)
++
++
++# clang-12 -Xclang -load -Xclang /media/hdisk2/MyPass/libMyPass.so -mllvm -slice -c test.c
++# clang-14 -flegacy-pass-manager -Xclang -load -Xclang /media/hdisk2/MyPass/libMyPass.so -mllvm -slice -c test.c
++
++# for new pass manager, use "-fplugin Bye.so" or "-Xclang -load -Xclang Bye.so" to allow passing cmd arguments.
++# for clang-12, we can also use "-fplugin MyPass.so" to replace "-Xclang ...".
++# for clang-12, use "-fexperimental-new-pass-manager -fplugin xxx -fpass-plugin xxx" to run with new pass manager.
++# use "-O1" for Bye.so because Bye pass does not run on optnone functions.
++# clang-14 -fplugin=Bye.so -fpass-plugin=Bye.so -mllvm -wave-goodbye -c ../test.c
++
++# using opt, both "-load xxx" and "--load-pass-plugin=xxx" should be used to use cmd arguments
+diff --git a/llvm/lib/Transforms/CapabilityLog/CapabilityLog.cpp b/llvm/lib/Transforms/CapabilityLog/CapabilityLog.cpp
+new file mode 100644
+index 000000000000..0ba22b74fbc8
+--- /dev/null
++++ b/llvm/lib/Transforms/CapabilityLog/CapabilityLog.cpp
+@@ -0,0 +1,422 @@
++#include "llvm/ADT/APFloat.h"
++#include "llvm/ADT/StringRef.h"
++#include "llvm/ADT/Twine.h"
++#include "llvm/Analysis/AliasAnalysis.h"
++#include "llvm/Analysis/BasicAliasAnalysis.h"
++#include "llvm/Analysis/CallGraph.h"
++#include "llvm/Analysis/LoopInfo.h"
++#include "llvm/Analysis/ScalarEvolution.h"
++#include "llvm/Analysis/TargetLibraryInfo.h"
++#include "llvm/Bitcode/BitcodeWriter.h"
++#include "llvm/IR/BasicBlock.h"
++#include "llvm/IR/Constant.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/DataLayout.h"
++#include "llvm/IR/DerivedTypes.h"
++#include "llvm/IR/Dominators.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/InstrTypes.h"
++#include "llvm/IR/Instruction.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/Intrinsics.h"
++#include "llvm/IR/LLVMContext.h"
++#include "llvm/IR/LegacyPassManager.h"
++#include "llvm/IR/Metadata.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/Type.h"
++#include "llvm/IR/Value.h"
++#include "llvm/Pass.h"
++#include "llvm/Passes/PassBuilder.h"
++#include "llvm/Support/Casting.h"
++#include "llvm/Support/ErrorHandling.h"
++#include "llvm/Support/Format.h"
++#include "llvm/Support/InstructionCost.h"
++#include "llvm/Support/JSON.h"
++#include "llvm/Support/raw_ostream.h"
++#include "llvm/Transforms/IPO/PassManagerBuilder.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
++
++using namespace llvm;
++using namespace std;
++
++namespace {
++struct LLVMCapabilityLogOnFunction : public FunctionPass {
++public:
++    static char ID;
++    
++    LLVMCapabilityLogOnFunction() : FunctionPass(ID) {
++        ErrorOr<unique_ptr<MemoryBuffer>> FileOrErr = MemoryBuffer::getFile(JsonPath);
++        if (error_code EC = FileOrErr.getError()) {
++            errs() << "Error reading file: " << EC.message() << "\n";
++            return;
++        }
++
++        Expected<json::Value> ParsedOrErr = json::parse(FileOrErr.get()->getBuffer());
++        if (!ParsedOrErr) {
++            errs() << "Error parsing JSON: " << toString(ParsedOrErr.takeError()) << "\n";
++            return;
++        }
++
++        JsonObj = ParsedOrErr->getAsObject();
++        if (!JsonObj) {
++            errs() << "Error: JSON is not an object\n";
++            return;
++        }
++
++        for (const auto &StructEntry : *JsonObj) {
++            const json::Array* CopyArr = StructEntry.second.getAsObject()->getArray("copy");
++            const json::Array* AllocArr = StructEntry.second.getAsObject()->getArray("alloc");
++            if (CopyArr == nullptr || CopyArr->empty() || AllocArr == nullptr || AllocArr->empty())
++                continue;
++
++            auto &ObjInf = St2Info[StructEntry.first.str()];
++            ObjInf.IsBridge = StructEntry.second.getAsObject()->getBoolean("bridge").getValue();
++            ObjInf.IsRouter = StructEntry.second.getAsObject()->getBoolean("router").getValue();
++            ObjInf.Index = StructEntry.second.getAsObject()->getInteger("index").getValue();
++            for (const auto &PathEntry : *CopyArr) {
++                ObjInf.CopyFuncs.insert(PathEntry.getAsString()->str());
++            }
++            for (const auto &PathEntry : *AllocArr) {
++                ObjInf.AllocFuncs.insert(PathEntry.getAsString()->str());
++            }
++        }
++    }
++    
++    bool DebugMod = false;
++    bool runOnFunction(Function& F) override {
++        bool Ret = false;
++        unordered_set<string> StNames;
++
++        // if (F.getName().equals("alloc_msg")) DebugMod = true;
++        findStructByFunction(F.getName(), StNames);
++        if (StNames.empty()) {
++            DebugMod = false;
++            return false;
++        }
++        errs() << "[*] " << F.getName() << "\n";
++if (DebugMod) errs() << F << "\n";
++
++        for (auto &BB : F) {
++            for (auto &I : BB) {
++                CallInst *CI = dyn_cast<CallInst>(&I);
++                if (CI == nullptr)
++                    continue;
++
++                StringRef CallFuncName = CI->getCalledOperand()->getName();
++
++                if (CallFuncName.contains("alloc") && 
++                    CallFuncName.startswith("k") &&
++                    !CallFuncName.contains("cache")) {
++if (DebugMod) errs() << "[CF] " << CallFuncName << "\n";
++                    Ret = insertAlloc(CI, StNames);
++                }
++                else if (CallFuncName.contains("memcpy") ||
++                    CallFuncName.contains("copy_from_user")) {
++if (DebugMod) errs() << "[CF] " << CallFuncName << "\n";
++                    Ret = insertCopy(CI, StNames);
++                }
++
++            }
++        }
++        if (!Ret) errs() << "[-] " << F.getName() << "\n";
++        else errs() << "[+] " << F.getName() << "\n";
++        DebugMod = false;
++        return Ret;
++    }
++
++private:
++    const string JsonPath = "/home/user/Tools/w2l/code/out/defdebug/dumpResults/merged_output.json";
++    json::Object* JsonObj;
++
++    struct ObjectInfo {
++        bool IsBridge = false, IsRouter = false;
++        uint8_t Index;
++        unordered_set<string> CopyFuncs;
++        unordered_set<string> AllocFuncs;
++    };
++    unordered_map<string, struct ObjectInfo> St2Info;
++
++    void findObjSources(Value* V, std::vector<llvm::Value *> &SrcSet) {
++        if (dyn_cast<Constant>(V) != nullptr) {
++            return;
++        }
++
++        if (LoadInst* LI = dyn_cast<LoadInst>(V)) {
++
++            SrcSet.push_back(V);
++
++            // alias handling
++            Function *F = LI->getFunction();
++
++            if(!F) return;
++
++            findObjSources(LI->getPointerOperand(), SrcSet);
++            return;
++        }
++
++        if (GetElementPtrInst* GEP = dyn_cast<GetElementPtrInst>(V)) {
++            SrcSet.push_back(V);
++            // Heuristic 2: first GEP is enough?
++            // Lewis: Wrong
++            findObjSources(GEP->getPointerOperand(), SrcSet);
++            return;
++        }
++
++        // Lewis: this guess hits, add one chicken leg tonight!
++        if (CallInst* CI = dyn_cast<CallInst>(V)) {
++            // Storing callInst helps to check from value type
++            SrcSet.push_back(V);
++            // Heuristic 1: calling to strlen()/vmalloc() isn't what we want
++            const Function* Callee = CI->getCalledFunction();
++            if (Callee != nullptr) {
++                std::string calleeName = Callee->getName().str();
++                if (calleeName == "strlen"||
++                    calleeName == "vmalloc")
++                    return;
++            }
++
++            if(!Callee) return;
++            // interprocedural analysis
++            for(const BasicBlock &BB : *Callee){
++                for(const Instruction &I : BB){
++                    if(const ReturnInst *RI = dyn_cast<ReturnInst>(&I)){
++                        if(Value *rValue = RI->getReturnValue()){
++                            findObjSources(rValue, SrcSet);
++                        }
++                    }
++                }
++            }
++            return;
++        }
++
++        if (ZExtInst* ZI = dyn_cast<ZExtInst>(V)) {
++            findObjSources(ZI->getOperand(0), SrcSet);
++            return;
++        }
++
++        if (TruncInst* TI = dyn_cast<TruncInst>(V)) {
++            findObjSources(TI->getOperand(0), SrcSet);
++            return;
++        }
++
++        if (BinaryOperator* BO = dyn_cast<BinaryOperator>(V)) {
++            for (unsigned i = 0, e = BO->getNumOperands(); i != e; i++) {
++                Value* Opd = BO->getOperand(i);
++                if (dyn_cast<Constant>(Opd) != nullptr)
++                    continue;
++                findObjSources(Opd, SrcSet);
++            }
++            return;
++        }
++
++        if(BitCastInst *BCI = dyn_cast<BitCastInst>(V)){
++            SrcSet.push_back(V);
++            findObjSources(BCI->getOperand(0), SrcSet);
++            return;
++        }
++
++        return;
++    }
++
++    string getAllocStName(CallInst *CI, const unordered_set<string> &StNames) {
++        if (CI->getNumOperands() < 2) return "";
++
++        StructType *StType = nullptr;
++        string StName;
++        for (auto *CallUser : CI->users()) {
++            if (auto *BCI = dyn_cast<BitCastInst>(CallUser)) {
++                PointerType* PtrType = dyn_cast<PointerType>(BCI->getDestTy());
++                Type* BaseType = PtrType->getPointerElementType();
++                StType = dyn_cast<StructType>(BaseType);
++                if (StType == nullptr)
++                    continue;
++                StName = StType->getStructName().str();
++                if (StNames.count(StName))break;
++                StName = "";
++            }
++            if (auto *SI = dyn_cast<StoreInst>(CallUser)) {
++                if (auto *GEP = dyn_cast<GetElementPtrInst>(SI->getPointerOperand())) {
++                    Type *BaseType = GEP->getSourceElementType();
++                    StType = dyn_cast<StructType>(BaseType);
++                    if (StType == nullptr)
++                        continue;
++                    StName = StType->getStructName().str();
++                    if (StNames.count(StName))break;
++                    StName = "";
++                }
++            }
++        }
++        return StName;
++    }
++
++    string getCopyStName(CallInst *CI, const unordered_set<string> &StNames) {
++        Value *Key = nullptr;
++        for (const string &StructName : StNames) {
++            if (St2Info[StructName].IsBridge) Key = CI->getArgOperand(2);
++            else Key = CI->getArgOperand(0);
++            vector<llvm::Value *> KeySet;
++
++            if (dyn_cast<ConstantInt>(Key) != nullptr)
++                continue;
++
++            findObjSources(Key, KeySet);
++            for (std::vector<llvm::Value*>::iterator i = KeySet.begin(), 
++                e = KeySet.end(); i != e; i++) {
++                Value *V = *i;
++                if(auto *LI = dyn_cast<LoadInst>(V)) {
++                    // check if it's loading a pointer
++                    if(LI->getPointerOperandType()->getPointerElementType()->isPointerTy()){
++                        continue;
++                    }
++
++                    if(GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(LI->getPointerOperand())){
++                        if (!GEP->getPointerOperandType()->getNonOpaquePointerElementType()->isStructTy())
++                            continue;
++                        if (GEP->getSourceElementType()->getStructName() == StructName)
++                            return StructName;
++                    }
++                }
++                else if (auto *BCI = dyn_cast<BitCastInst>(V)) {
++                    StructType *StTy = dyn_cast<StructType>(BCI->getSrcTy()->getPointerElementType());
++                    if (StTy == nullptr || StTy->getStructName() != StructName)
++                        continue;
++                    return StructName;
++                }
++            }
++        }
++        return "";
++    }
++
++    FunctionCallee getLogCapFunction(Module &M) {
++        LLVMContext &Context = M.getContext();
++        FunctionCallee LogCapFunction = M.getFunction("log_cap");
++
++        if (!LogCapFunction) {
++            // 声明函数 log_cap
++            Type *VoidTy = Type::getVoidTy(Context);
++            Type *Int8PtrTy = Type::getInt8PtrTy(Context);
++            Type *Int64Ty = Type::getInt64Ty(Context);
++            Type *UInt8Ty = Type::getInt8Ty(Context);
++
++            std::vector<Type *> ParamTypes = {Int8PtrTy, Int8PtrTy, Int64Ty, UInt8Ty};
++            FunctionType *FuncType = FunctionType::get(VoidTy, ParamTypes, false);
++
++            LogCapFunction = M.getOrInsertFunction("log_cap", FuncType);
++        }
++
++        return LogCapFunction;
++    }
++
++    void insertCall(CallInst *CI, Value *Dst, Value *Src, Value *Len, const string &StName) {
++        BasicBlock *BB = CI->getParent();
++        Module *M = BB->getModule();
++        LLVMContext &Context = M->getContext();
++
++        IRBuilder<> Builder(Context);
++        Builder.SetInsertPoint(CI);
++
++        FunctionCallee LogCapFunction = getLogCapFunction(*M);
++
++        IntegerType *UInt8Ty = IntegerType::getInt16Ty(CI->getContext());
++        unsigned Index = St2Info[StName].Index;
++        ConstantInt *Hash = ConstantInt::get(UInt8Ty, Index, false);
++        errs() << "[H] " << StName << ":#" << Index << "\n";
++
++        std::vector<Value *> Args = {Dst, Src, Len, Hash};
++        Builder.CreateCall(LogCapFunction, Args);
++    }
++
++    bool insertAlloc(CallInst *CI, const unordered_set<string> &StNames) {
++        string StName = getAllocStName(CI, StNames);
++        if (StName.empty())
++            return false;
++
++        PointerType *PointerTy = PointerType::getInt8PtrTy(CI->getContext());
++        Value *Dst = Constant::getNullValue(PointerTy);
++        Value *Src = Constant::getNullValue(PointerTy);
++        Value *Len = CI->getArgOperand(0);
++
++        insertCall(CI, Dst, Src, Len, StName);
++        return true;
++    }
++
++    bool insertCopy(CallInst *CI, const unordered_set<string> &StNames) {
++        string StName = getCopyStName(CI, StNames);
++        if (StName.empty())
++            return false;
++
++        Value *Dst = CI->getArgOperand(0);
++        Value *Src = CI->getArgOperand(1);
++        Value *Len = CI->getArgOperand(2);
++
++        insertCall(CI, Dst, Src, Len, StName);
++        return true;
++    }
++
++    void findStructByFunction(const StringRef FuncName, unordered_set<string> &StNames) const {
++        for (auto s2i : St2Info) {
++            for (auto &Func : s2i.second.CopyFuncs) {
++                if (FuncName.equals(Func)) {
++                    StNames.insert(s2i.first);
++                }
++            }
++            for (auto &Func : s2i.second.AllocFuncs) {
++                if (FuncName.equals(Func)) {
++                    StNames.insert(s2i.first);
++                }
++            }
++        }
++        return;
++    }
++};
++
++struct LLVMGenerateBitCodeOnModule : public ModulePass {
++public:
++    static char ID;
++
++    LLVMGenerateBitCodeOnModule() : ModulePass(ID) {}
++
++    bool runOnModule(Module& M) override {
++        errs() << "[M] " << M.getName() << "\n";
++        return false;
++    }
++};
++
++char LLVMCapabilityLogOnFunction::ID = 0;
++static RegisterPass<LLVMCapabilityLogOnFunction> XF("log-cap-function", "Log Capability Function Pass");
++static llvm::RegisterStandardPasses YF(
++    llvm::PassManagerBuilder::EP_EarlyAsPossible,
++    [](const llvm::PassManagerBuilder &KmallocBuilder,
++       llvm::legacy::PassManagerBase &PM) { PM.add(new LLVMCapabilityLogOnFunction()); });
++} // namespace
++
++// namespace {
++// struct LLVMCapabilityLogOnModule : public ModulePass {
++// public:
++//     static char ID;
++    
++//     LLVMCapabilityLogOnModule() : ModulePass(ID) {}
++    
++//     bool runOnModule(Module& M) override {
++//         for (auto &F : M) {
++//             errs() << "Found a func: " << F.getName() << "\n";
++//         }
++//         return false;
++//     }
++// };
++
++// char LLVMCapabilityLogOnModule::ID = 0;
++// static RegisterPass<LLVMCapabilityLogOnModule> XM("trace-malloc-module", "Trace Malloc Module Pass");
++// static llvm::RegisterStandardPasses YM(
++//     llvm::PassManagerBuilder::EP_EnabledOnOptLevel0,
++//     [](const llvm::PassManagerBuilder &KmallocBuilder,
++//        llvm::legacy::PassManagerBase &PM) { PM.add(new LLVMCapabilityLogOnModule()); });
++
++// } // namespace
++
+diff --git a/llvm/lib/Transforms/IPO/DeadArgumentElimination.cpp b/llvm/lib/Transforms/IPO/DeadArgumentElimination.cpp
+index 2a6e38b0437f..c97a2c2b3889 100644
+--- a/llvm/lib/Transforms/IPO/DeadArgumentElimination.cpp
++++ b/llvm/lib/Transforms/IPO/DeadArgumentElimination.cpp
+@@ -50,6 +50,10 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "llvm/Bitcode/BitcodeWriter.h"
++#include "llvm/Support/ToolOutputFile.h"
++#include "llvm/Support/FileSystem.h"
++
+ using namespace llvm;
+ 
+ #define DEBUG_TYPE "deadargelim"
+@@ -1088,6 +1092,17 @@ bool DeadArgumentEliminationPass::RemoveDeadStuffFromFunction(Function *F) {
+ 
+ PreservedAnalyses DeadArgumentEliminationPass::run(Module &M,
+                                                    ModuleAnalysisManager &) {
++  std::string FileName = M.getSourceFileName();
++  if (FileName.find(".c") != FileName.npos) {
++    std::string Path = M.getSourceFileName() + ".bc";
++    errs() << "[BC] " << Path << "\n";
++    std::error_code EC;
++    raw_fd_ostream out(Path, EC, sys::fs::OF_None);
++    WriteBitcodeToFile(M, out);
++    out.flush();
++    out.close();
++  }
++
+   bool Changed = false;
+ 
+   // First pass: Do a simple check to see if any functions can have their "..."
